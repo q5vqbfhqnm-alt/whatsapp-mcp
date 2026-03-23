@@ -1,0 +1,37 @@
+services:
+  whatsapp-bridge:
+    build: ./whatsapp-bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - bridge-store:/app/store
+    environment:
+      - WHATSAPP_BRIDGE_PORT=8080
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  mcp-server:
+    build: ./whatsapp-mcp-server
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8765:8765"
+    volumes:
+      - bridge-store:/data
+    depends_on:
+      whatsapp-bridge:
+        condition: service_started
+    environment:
+      - MCP_TRANSPORT=sse
+      - MCP_API_KEY=${MCP_API_KEY}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8765
+      - WHATSAPP_API_URL=http://whatsapp-bridge:8080/api
+      - WHATSAPP_DB_PATH=/data/messages.db
+
+volumes:
+  bridge-store:
