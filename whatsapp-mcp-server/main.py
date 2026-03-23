@@ -1,8 +1,14 @@
+import os
 import signal
 import sys
 from typing import Any
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from whatsapp import (
     download_media as whatsapp_download_media,
@@ -366,6 +372,26 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": False, "message": "Failed to download media"}
 
 
+class ApiKeyAuthMiddleware:
+    """ASGI middleware that checks for a valid API key in the Authorization header."""
+
+    def __init__(self, app: ASGIApp, api_key: str) -> None:
+        self.app = app
+        self.api_key = api_key
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            from starlette.requests import Request as _Req
+
+            request = _Req(scope, receive)
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {self.api_key}":
+                response = JSONResponse({"error": "Unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""
     sys.exit(0)
@@ -376,5 +402,26 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Initialize and run the server
-    mcp.run(transport="stdio")
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+
+    if transport == "sse":
+        api_key = os.getenv("MCP_API_KEY")
+        if not api_key:
+            print("ERROR: MCP_API_KEY is required when using SSE transport", file=sys.stderr)
+            sys.exit(1)
+
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_PORT", "8765"))
+
+        # Build the SSE Starlette app and wrap with auth middleware
+        app = mcp.sse_app()
+        app.add_middleware(ApiKeyAuthMiddleware, api_key=api_key)
+
+        config = uvicorn.Config(app, host=host, port=port, log_level="info")
+        server = uvicorn.Server(config)
+
+        import anyio
+
+        anyio.run(server.serve)
+    else:
+        mcp.run(transport="stdio")
