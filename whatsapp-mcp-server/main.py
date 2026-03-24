@@ -1,13 +1,17 @@
+import hashlib
 import os
+import secrets
 import signal
 import sys
+import urllib.parse
 from typing import Any
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from whatsapp import (
@@ -373,7 +377,15 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
 
 
 class ApiKeyAuthMiddleware:
-    """ASGI middleware that checks for a valid API key in the Authorization header."""
+    """ASGI middleware that checks for a valid Bearer token on MCP endpoints."""
+
+    # Paths that bypass Bearer auth (handled by OAuth routes or public)
+    BYPASS_PATHS = (
+        "/.well-known/",
+        "/authorize",
+        "/token",
+        "/register",
+    )
 
     def __init__(self, app: ASGIApp, api_key: str) -> None:
         self.app = app
@@ -381,6 +393,13 @@ class ApiKeyAuthMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
+            path = scope.get("path", "")
+
+            # OAuth endpoints are handled by explicit routes, let them through
+            if any(path.startswith(p) for p in self.BYPASS_PATHS):
+                await self.app(scope, receive, send)
+                return
+
             from starlette.requests import Request as _Req
 
             request = _Req(scope, receive)
@@ -390,6 +409,100 @@ class ApiKeyAuthMiddleware:
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+# --- Minimal OAuth 2.1 server for claude.ai connector compatibility ---
+
+# In-memory stores (fine for single-instance deployment)
+_oauth_clients: dict[str, dict] = {}
+_oauth_codes: dict[str, dict] = {}
+
+
+def build_oauth_routes(api_key: str, base_url: str) -> list[Route]:
+    """Build OAuth routes that issue the MCP API key as the access token."""
+
+    async def metadata(request: Request):
+        """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
+        return JSONResponse({
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/authorize",
+            "token_endpoint": f"{base_url}/token",
+            "registration_endpoint": f"{base_url}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+        })
+
+    async def register(request: Request):
+        """Dynamic client registration (RFC 7591)."""
+        body = await request.json()
+        client_id = secrets.token_hex(16)
+        _oauth_clients[client_id] = {
+            "redirect_uris": body.get("redirect_uris", []),
+            "client_name": body.get("client_name", "unknown"),
+        }
+        return JSONResponse({
+            "client_id": client_id,
+            "redirect_uris": body.get("redirect_uris", []),
+            "client_name": body.get("client_name", "unknown"),
+        }, status_code=201)
+
+    async def authorize(request: Request):
+        """Authorization endpoint — auto-approves and redirects with code."""
+        client_id = request.query_params.get("client_id", "")
+        redirect_uri = request.query_params.get("redirect_uri", "")
+        state = request.query_params.get("state", "")
+        code_challenge = request.query_params.get("code_challenge", "")
+        code_challenge_method = request.query_params.get("code_challenge_method", "")
+
+        # Generate auth code
+        code = secrets.token_hex(32)
+        _oauth_codes[code] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+        }
+
+        # Redirect back with code
+        params = urllib.parse.urlencode({"code": code, "state": state})
+        return RedirectResponse(f"{redirect_uri}?{params}", status_code=302)
+
+    async def token(request: Request):
+        """Token endpoint — exchanges auth code for access token (our API key)."""
+        body = await request.form()
+        grant_type = body.get("grant_type", "")
+        code = body.get("code", "")
+        code_verifier = body.get("code_verifier", "")
+
+        if grant_type != "authorization_code":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+        stored = _oauth_codes.pop(code, None)
+        if not stored:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+        # Verify PKCE code_challenge
+        if stored.get("code_challenge"):
+            digest = hashlib.sha256(code_verifier.encode()).digest()
+            import base64
+            computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+            if computed != stored["code_challenge"]:
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+        return JSONResponse({
+            "access_token": api_key,
+            "token_type": "bearer",
+            "scope": "",
+        })
+
+    return [
+        Route("/.well-known/oauth-authorization-server", metadata, methods=["GET"]),
+        Route("/register", register, methods=["POST"]),
+        Route("/authorize", authorize, methods=["GET"]),
+        Route("/token", token, methods=["POST"]),
+    ]
 
 
 def shutdown_handler(signum, frame):
@@ -412,9 +525,17 @@ if __name__ == "__main__":
 
         host = os.getenv("MCP_HOST", "0.0.0.0")
         port = int(os.getenv("MCP_PORT", "8765"))
+        base_url = os.getenv("MCP_BASE_URL", f"https://wa.cansavasan.com")
 
-        # Build the SSE Starlette app and wrap with auth middleware
+        # Build the SSE Starlette app
         app = mcp.sse_app()
+
+        # Add OAuth routes
+        oauth_routes = build_oauth_routes(api_key, base_url)
+        for route in oauth_routes:
+            app.routes.insert(0, route)
+
+        # Add auth middleware (skips OAuth paths)
         app.add_middleware(ApiKeyAuthMiddleware, api_key=api_key)
 
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
