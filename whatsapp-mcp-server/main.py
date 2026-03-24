@@ -417,6 +417,25 @@ class ApiKeyAuthMiddleware:
 _oauth_clients: dict[str, dict] = {}
 _oauth_codes: dict[str, dict] = {}
 
+LOGIN_PAGE = """<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp MCP — Authorize</title>
+<style>
+body{font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#fff}
+.card{background:#1a1a1a;padding:40px;border-radius:12px;width:100%;max-width:360px;box-shadow:0 4px 24px rgba(0,0,0,.5)}
+h1{font-size:1.3rem;margin:0 0 24px;text-align:center}
+input[type=password]{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0a0a0a;color:#fff;font-size:1rem;box-sizing:border-box;margin-bottom:16px}
+button{width:100%;padding:12px;border:none;border-radius:8px;background:#25D366;color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+button:hover{background:#1da851}
+</style></head>
+<body><div class="card">
+<h1>WhatsApp MCP</h1>
+{{error}}
+<form method="POST" action="{{action}}">
+<input type="password" name="password" placeholder="Enter password" autofocus required>
+<button type="submit">Authorize</button>
+</form></div></body></html>"""
+
 
 def build_oauth_routes(api_key: str, base_url: str) -> list[Route]:
     """Build OAuth routes that issue the MCP API key as the access token."""
@@ -449,25 +468,38 @@ def build_oauth_routes(api_key: str, base_url: str) -> list[Route]:
         }, status_code=201)
 
     async def authorize(request: Request):
-        """Authorization endpoint — auto-approves and redirects with code."""
+        """Authorization endpoint — requires password before issuing auth code."""
         client_id = request.query_params.get("client_id", "")
         redirect_uri = request.query_params.get("redirect_uri", "")
         state = request.query_params.get("state", "")
         code_challenge = request.query_params.get("code_challenge", "")
         code_challenge_method = request.query_params.get("code_challenge_method", "")
 
-        # Generate auth code
-        code = secrets.token_hex(32)
-        _oauth_codes[code] = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
-            "code_challenge_method": code_challenge_method,
-        }
+        oauth_password = os.getenv("MCP_OAUTH_PASSWORD", "")
 
-        # Redirect back with code
-        params = urllib.parse.urlencode({"code": code, "state": state})
-        return RedirectResponse(f"{redirect_uri}?{params}", status_code=302)
+        if request.method == "POST":
+            form = await request.form()
+            password = form.get("password", "")
+
+            if not oauth_password or password != oauth_password:
+                # Re-render form with error
+                qs = request.url.query
+                return HTMLResponse(LOGIN_PAGE.replace("{{action}}", f"/authorize?{qs}").replace("{{error}}", '<p style="color:#e74c3c;margin-bottom:16px">Wrong password.</p>'), status_code=403)
+
+            # Password correct — issue auth code
+            code = secrets.token_hex(32)
+            _oauth_codes[code] = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+                "code_challenge_method": code_challenge_method,
+            }
+            params = urllib.parse.urlencode({"code": code, "state": state})
+            return RedirectResponse(f"{redirect_uri}?{params}", status_code=302)
+
+        # GET — show login form
+        qs = request.url.query
+        return HTMLResponse(LOGIN_PAGE.replace("{{action}}", f"/authorize?{qs}").replace("{{error}}", ""))
 
     async def token(request: Request):
         """Token endpoint — exchanges auth code for access token (our API key)."""
@@ -500,7 +532,7 @@ def build_oauth_routes(api_key: str, base_url: str) -> list[Route]:
     return [
         Route("/.well-known/oauth-authorization-server", metadata, methods=["GET"]),
         Route("/register", register, methods=["POST"]),
-        Route("/authorize", authorize, methods=["GET"]),
+        Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
     ]
 
