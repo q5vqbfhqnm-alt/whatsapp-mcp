@@ -32,6 +32,7 @@ services:
       - MCP_PORT=8765
       - WHATSAPP_API_URL=http://whatsapp-bridge:8080/api
       - WHATSAPP_DB_PATH=/data/messages.db
+      - MCP_OAUTH_PASSWORD=${MCP_OAUTH_PASSWORD}
 
 volumes:
   bridge-store:
